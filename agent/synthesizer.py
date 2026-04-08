@@ -6,6 +6,10 @@ import shutil
 from pydantic import BaseModel, Field
 from typing import List, Set
 
+from logutil import get_logger, setup_logging, Colors
+
+log = get_logger(__name__)
+
 # --- 1. CONFIGURATION ---
 LM_STUDIO_API = "http://127.0.0.1:1234/v1/chat/completions" # Standard OpenAI-compatible endpoint for LM Studio
 RAW_DIR = "/Users/svenpohle/Desktop/Wiki/raw"
@@ -164,7 +168,7 @@ def call_lmstudio_api(
 ) -> SynthesisOutput | None:
     """Sends the prompt to LM Studio and attempts to parse the structured response."""
     label = f" ({source_label})" if source_label else ""
-    print(f"🧠 Calling LM Studio API{label}...")
+    log.info(f"  -> Calling LM Studio API{label}...", color=Colors.CYAN)
     existing_tags = existing_tags or set()
     if existing_tags:
         tag_section = (
@@ -202,26 +206,31 @@ def call_lmstudio_api(
         data = response.json()
         llm_text = data['choices'][0]['message']['content']
 
-        print("✅ Received raw text from LLM. Attempting structured parsing...")
+        log.info("  -> Received raw text from LLM. Attempting structured parsing...", color=Colors.CYAN)
         try:
             parsed_data = parse_json_from_llm(llm_text)
             parsed_data = normalize_synthesis_parsed(parsed_data)
             return SynthesisOutput(**parsed_data)
         except json.JSONDecodeError as e:
-            print("⚠️ PARSING FAILED: Could not parse JSON from the model response.")
-            print(f"   {e.msg} (at char {getattr(e, 'pos', '?')})")
+            log.warning("PARSING FAILED: Could not parse JSON from the model response.")
+            log.warning(f"   {e.msg} (at char {getattr(e, 'pos', '?')})")
             if e.doc and isinstance(e.doc, str) and getattr(e, "pos", None) is not None:
                 pos = min(e.pos, len(e.doc))
                 lo = max(0, pos - 80)
                 hi = min(len(e.doc), pos + 80)
-                print("   Context around error:", repr(e.doc[lo:hi]))
+                log.warning("   Context around error: %r", e.doc[lo:hi])
             else:
-                print("   Raw LLM Output Snippet:", llm_text[:800])
+                log.warning("   Raw LLM Output Snippet: %s", llm_text[:800])
             return None
 
     except requests.exceptions.RequestException as e:
-        print(f"❌ API CONNECTION ERROR: Could not connect to LM Studio server at 127.0.0.1:1234.")
-        print(f"   Ensure the model is loaded and the server is running in LM Studio. Error: {e}")
+        log.error(
+            "API CONNECTION ERROR: Could not connect to LM Studio server at 127.0.0.1:1234."
+        )
+        log.error(
+            "   Ensure the model is loaded and the server is running in LM Studio. Error: %s",
+            e,
+        )
         return None
 
 
@@ -238,12 +247,14 @@ def write_concept_file(concept: Concept, output_stem: str) -> None:
         f.write(generate_tag_links(concept.tags))
         # 3. Write the main summary content
         f.write(concept.summary_markdown)
-    print(f"   ✅ Wrote {filename} ({concept.title})")
+    log.info(f"  -> Wrote {filename} ({concept.title})", color=Colors.GREEN)
 
 
 # --- 4. MAIN EXECUTION BLOCK ---
 
 if __name__ == "__main__":
+    setup_logging()
+
     # One raw .md file -> one API call -> exactly one concept -> one file in CONCEPTS_DIR
     # Output filename is derived from the raw filename (e.g. foo.md -> foo.md in concepts).
 
@@ -260,25 +271,25 @@ if __name__ == "__main__":
     """
 
     if not os.path.isdir(RAW_DIR):
-        print(f"❌ Raw directory not found: {RAW_DIR}")
+        log.error("Raw directory not found: %s", RAW_DIR)
         exit(1)
 
     existing_tags = collect_existing_tags(CONCEPTS_DIR)
-    print(f"🏷️  Existing vault tags from /concepts: {len(existing_tags)} found")
+    log.info(f"Existing vault tags from [concepts]: {len(existing_tags)} tags found", color=Colors.GREEN)
 
     raw_files = list_raw_markdown_files()
     if not raw_files:
-        print(f"❌ No .md files in {RAW_DIR}")
+        log.error("No .md files in %s", RAW_DIR)
         exit(1)
 
-    print(f"📚 Processing {len(raw_files)} raw file(s), one concept per file.\n")
+    log.info(f"Processing {len(raw_files)} raw file(s), one concept per file", color=Colors.CYAN)
 
     for raw_name in raw_files:
-        print(f"📄 {raw_name}")
+        log.info(f"  -> Processing RAW: {raw_name}", color=Colors.GREEN)
         try:
             body = load_raw_file_contents(raw_name)
         except OSError as e:
-            print(f"   ❌ Could not read file: {e}")
+            log.error("  -> Could not read file: %s", e)
             continue
 
         context = f"SOURCE FILE: {raw_name}\n\n{body}"
@@ -290,12 +301,12 @@ if __name__ == "__main__":
         )
 
         if not synthesis_result or not synthesis_result.concepts:
-            print("   🛑 No concept produced; skipping.")
+            log.warning("\tNo concept produced; skipping.")
             continue
 
         if len(synthesis_result.concepts) > 1:
-            print(
-                f"   ⚠️ Model returned {len(synthesis_result.concepts)} concepts; "
+            log.warning(
+                f"\tModel returned {len(synthesis_result.concepts)} concepts; "
                 "using only the first for one-to-one mode.",
             )
 
@@ -313,9 +324,9 @@ if __name__ == "__main__":
             destination_path = os.path.join(target_dir, raw_name)
             shutil.move(src_path, destination_path)
         except OSError as e:
-            print(f"   ⚠️ OS Error during file move for {raw_name}: {e}")
+            log.warning("   OS Error during file move for %s: %s", raw_name, e)
 
         for t in normalize_tag_list(concept.tags) or ["wiki"]:
             existing_tags.add(t)
 
-    print("\n🎉 Synthesis run finished.")
+    log.info("\nSynthesis run finished.")
