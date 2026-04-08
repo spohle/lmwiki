@@ -8,6 +8,12 @@ from typing import List, Set
 
 from logutil import get_logger, setup_logging, Colors
 
+
+from textual.app import App, ComposeResult
+from textual.widgets import Header, Footer, OptionList, RichLog
+from textual.widgets.option_list import Option
+from textual.containers import Vertical
+
 log = get_logger(__name__)
 
 # --- 1. CONFIGURATION ---
@@ -33,6 +39,73 @@ class SynthesisOutput(BaseModel):
         description="exactly one concept when synthesizing a single raw document; array must hold one object",
     )
 
+
+class SynthApp(App):
+    CSS = """
+        #output-box {
+            height: 75vh;
+            border: panel;
+            background: $boost;
+        }
+
+        #menu-box {
+            height: 25vh;
+            border-top: solid $primary;
+        }
+
+        OptionList {
+            background: $surface;
+        }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+
+        yield RichLog(id="output-box", highlight=True, markup=True)
+
+        with Vertical(id="menu-box"):
+            yield OptionList(
+                Option("1. List Raw Notes", id="list_raw"),
+                Option("2. Synthesize Raw Notes", id="synth_raw"),
+                Option("3. Exit System", id="exit"),
+                id="menu"
+            )
+
+        yield Footer()
+
+    def on_mount(self) -> None:
+        """Sets focus to the menu as soon as the app starts."""
+        self.query_one("#menu").focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        """Called when user highlights an option and presses Enter."""
+        option_id = event.option.id
+        
+        if option_id is None:
+            return
+        
+        # Mapping IDs to specific function calls
+        actions = {
+            "list_raw": self.list_raw_notes,
+            "synth_raw": self.synthesize_raw_notes,
+            "exit": self.exit_app
+        }
+        
+        action_func = actions.get(option_id)
+        if action_func:
+            action_func()
+
+    def list_raw_notes(self):
+        out = self.query_one("#output-box", RichLog)
+        out.write("Listing raw notes...")
+    
+    def synthesize_raw_notes(self):
+        out = self.query_one("#output-box", RichLog)
+        out.write("Starting synthesis of raw notes...")
+
+    def exit_app(self):
+        self.exit()
+        
 
 # --- 3. CORE FUNCTIONS ---
 
@@ -252,7 +325,7 @@ def write_concept_file(concept: Concept, output_stem: str) -> None:
 
 # --- 4. MAIN EXECUTION BLOCK ---
 
-if __name__ == "__main__":
+def manual_synth():
     setup_logging()
 
     # One raw .md file -> one API call -> exactly one concept -> one file in CONCEPTS_DIR
@@ -330,3 +403,7 @@ if __name__ == "__main__":
             existing_tags.add(t)
 
     log.info("\nSynthesis run finished.")
+
+if __name__ == "__main__":
+    app = SynthApp()
+    app.run()
