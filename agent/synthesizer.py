@@ -6,6 +6,7 @@ import os
 import shutil
 from pydantic import BaseModel, Field
 from typing import List, Set
+from pathlib import Path
 
 from logutil import get_logger, setup_logging, Colors
 
@@ -16,11 +17,17 @@ from textual.containers import Vertical
 
 log = get_logger(__name__)
 
+GEMINI_KEY = "AIzaSyAAb6jPZL-kdGHWhOL-m6tQL0OKmhbu8KI"
+
+
 # --- 1. CONFIGURATION ---
-LM_STUDIO_API = "http://127.0.0.1:1234/v1/chat/completions" # Standard OpenAI-compatible endpoint for LM Studio
-RAW_DIR = "/Users/svenpohle/Desktop/Wiki/raw"
-CONCEPTS_DIR = "/Users/svenpohle/Desktop/Wiki/concepts"
-WIKI_DIR = "/Users/svenpohle/Desktop/Wiki"
+# Using Gemini online API via GEMINI_KEY
+
+CUR_DIR = Path(__file__).parent.parent.resolve() # agent/ directory; adjust if your structure differs
+
+RAW_DIR = CUR_DIR / "raw"
+CONCEPTS_DIR = CUR_DIR / "concepts"
+WIKI_DIR = CUR_DIR / "wiki"
 
 # --- 2. DATA STRUCTURE DEFINITION (Pydantic) ---
 # This tells the LLM EXACTLY what format to return, making parsing reliable
@@ -76,6 +83,7 @@ class SynthApp(App):
 
     def on_mount(self) -> None:
         """Sets focus to the menu as soon as the app starts."""
+        self.theme = "dracula"
         self.query_one("#menu").focus()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
@@ -99,10 +107,25 @@ class SynthApp(App):
     def list_raw_notes(self):
         out = self.query_one("#output-box", RichLog)
         out.write("Listing raw notes...")
+
+        raw_path = Path(RAW_DIR)
+        if not raw_path.exists() or not raw_path.is_dir():
+            out.write(f"Raw directory not found: {RAW_DIR}")
+            return
+        
+        raw_md_files = sorted(f for f in raw_path.iterdir() if f.is_file() and f.suffix == ".md")
+        if not raw_md_files:
+            out.write(f"No .md files found in the raw directory: {RAW_DIR}.")
+            return
+        
+        for file in raw_md_files:
+            out.write(f"RAW -> {file.name}")
+
     
     def synthesize_raw_notes(self):
         out = self.query_one("#output-box", RichLog)
         out.write("Starting synthesis of raw notes...")
+        manual_synth()
 
     def exit_app(self):
         self.exit()
@@ -233,16 +256,16 @@ def generate_tag_links(tags: List[str]) -> str:
     return links
 
 
-def call_lmstudio_api(
+def call_gemini_api(
     context_data: str,
     system_prompt: str,
     existing_tags: Set[str] | None = None,
     *,
     source_label: str | None = None,
 ) -> SynthesisOutput | None:
-    """Sends the prompt to LM Studio and attempts to parse the structured response."""
+    """Sends the prompt to Gemini API and attempts to parse the structured response."""
     label = f" ({source_label})" if source_label else ""
-    log.info(f"  -> Calling LM Studio API{label}...", color=Colors.CYAN)
+    log.info(f"  -> Calling Gemini API{label}...", color=Colors.CYAN)
     existing_tags = existing_tags or set()
     if existing_tags:
         tag_section = (
@@ -257,28 +280,32 @@ def call_lmstudio_api(
         )
     full_system_prompt = system_prompt + tag_section
 
-    # The user message combines the instructions with the data (context_data)
-    user_message = f"{full_system_prompt}\n\n---\nCONTEXT DATA:\n{context_data}"
+    # The user message is just the context data
+    user_message = f"CONTEXT DATA:\n{context_data}"
 
     headers = {"Content-Type": "application/json"}
+    
     payload = {
-        "model": "your_loaded_model_name", # IMPORTANT: Replace this with the name of the model you loaded in LM Studio!
-        "messages": [
-            {"role": "system", "content": full_system_prompt},
-            {"role": "user", "content": user_message}
-        ],
-        "temperature": 0.1, # Keep temperature low for deterministic knowledge extraction
-        # Long JSON + markdown in strings; default caps often truncate mid-string and break JSON.
-        "max_tokens": 16384,
+        "systemInstruction": {
+            "parts": [{"text": full_system_prompt}]
+        },
+        "contents": [{
+            "parts": [{"text": user_message}]
+        }],
+        "generationConfig": {
+            "temperature": 0.1,
+            "responseMimeType": "application/json"
+        }
     }
 
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
+
     try:
-        response = requests.post(LM_STUDIO_API, headers=headers, json=payload)
-        response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status() 
         
-        # LM Studio returns a structure similar to OpenAI's response
         data = response.json()
-        llm_text = data['choices'][0]['message']['content']
+        llm_text = data['candidates'][0]['content']['parts'][0]['text']
 
         log.info("  -> Received raw text from LLM. Attempting structured parsing...", color=Colors.CYAN)
         try:
@@ -299,12 +326,12 @@ def call_lmstudio_api(
 
     except requests.exceptions.RequestException as e:
         log.error(
-            "API CONNECTION ERROR: Could not connect to LM Studio server at 127.0.0.1:1234."
+            "API CONNECTION ERROR: Could not connect to Gemini API."
         )
-        log.error(
-            "   Ensure the model is loaded and the server is running in LM Studio. Error: %s",
-            e,
-        )
+        if hasattr(e, "response") and e.response is not None:
+            log.error(f"   Response status: {e.response.status_code}. Detail: {e.response.text}")
+        else:
+            log.error(f"   Error: {e}")
         return None
 
 
@@ -367,7 +394,7 @@ def manual_synth():
             continue
 
         context = f"SOURCE FILE: {raw_name}\n\n{body}"
-        synthesis_result = call_lmstudio_api(
+        synthesis_result = call_gemini_api(
             context,
             SYSTEM_PROMPT,
             existing_tags,
@@ -406,5 +433,6 @@ def manual_synth():
     log.info("\nSynthesis run finished.")
 
 if __name__ == "__main__":
-    app = SynthApp()
-    app.run()
+    #app = SynthApp()
+    #app.run()
+    manual_synth()
