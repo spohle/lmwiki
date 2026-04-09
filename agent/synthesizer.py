@@ -17,7 +17,10 @@ from textual.containers import Vertical
 
 log = get_logger(__name__)
 
-GEMINI_KEY = "AIzaSyAAb6jPZL-kdGHWhOL-m6tQL0OKmhbu8KI"
+GEMINI_KEY = os.environ.get("GEMINI_KEY")
+if not GEMINI_KEY:
+    log.error("GEMINI_KEY environment variable is not set. Please export it before running.")
+    exit(1)
 
 
 # --- 1. CONFIGURATION ---
