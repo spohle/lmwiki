@@ -1,3 +1,4 @@
+from __future__ import annotations
 import re
 import requests
 import json
@@ -7,7 +8,6 @@ from pydantic import BaseModel, Field
 from typing import List, Set
 
 from logutil import get_logger, setup_logging, Colors
-
 
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, OptionList, RichLog
@@ -44,17 +44,18 @@ class SynthApp(App):
     CSS = """
         #output-box {
             height: 75vh;
-            border: panel;
+            border: solid;
             background: $boost;
         }
 
         #menu-box {
             height: 25vh;
-            border-top: solid $primary;
+            border: none;
         }
 
         OptionList {
             background: $surface;
+            border: none;
         }
     """
 
