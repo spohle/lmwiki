@@ -1,366 +1,334 @@
 from __future__ import annotations
-import re
-import requests
+
 import json
 import os
+import re
 import shutil
-from pydantic import BaseModel, Field
-from typing import List, Set
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import List, Set
 
-from logutil import get_logger, setup_logging, Colors
+import requests
+from pydantic import BaseModel, Field
 
-from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, OptionList, RichLog
-from textual.widgets.option_list import Option
-from textual.containers import Vertical
+from logutil import Colors, get_logger, setup_logging
 
 log = get_logger(__name__)
 
-GEMINI_KEY = os.environ.get("GEMINI_KEY")
-if not GEMINI_KEY:
-    log.error("GEMINI_KEY environment variable is not set. Please export it before running.")
-    exit(1)
+
+# --- Data models (Pydantic) ---
 
 
-# --- 1. CONFIGURATION ---
-# Using Gemini online API via GEMINI_KEY
-
-CUR_DIR = Path(__file__).parent.parent.resolve() # agent/ directory; adjust if your structure differs
-
-RAW_DIR = CUR_DIR / "raw"
-CONCEPTS_DIR = CUR_DIR / "concepts"
-WIKI_DIR = CUR_DIR / "wiki"
-
-# --- 2. DATA STRUCTURE DEFINITION (Pydantic) ---
-# This tells the LLM EXACTLY what format to return, making parsing reliable
 class Concept(BaseModel):
     """A single synthesized Knowledge concept"""
+
     title: str = Field(description="the concise title of the core idea")
-    summary_markdown: str = Field(description="a complete markdown article summarizing this concept. must be self contained and ready for obsidian viewing")
+    summary_markdown: str = Field(
+        description="a complete markdown article summarizing this concept. must be self contained and ready for obsidian viewing"
+    )
     tags: List[str] = Field(
         default_factory=list,
         description="3-8 short lowercase slug tags (letters, digits, hyphens only in output); reuse existing vault tags when relevant; omit # in JSON",
     )
 
+
 class SynthesisOutput(BaseModel):
     """Wrapper for the LLM JSON; for one-to-one mode use exactly one concept per call."""
+
     concepts: List[Concept] = Field(
         description="exactly one concept when synthesizing a single raw document; array must hold one object",
     )
 
 
-class SynthApp(App):
-    CSS = """
-        #output-box {
-            height: 75vh;
-            border: solid;
-            background: $boost;
-        }
+# --- Configuration ---
 
-        #menu-box {
-            height: 25vh;
-            border: none;
-        }
 
-        OptionList {
-            background: $surface;
-            border: none;
-        }
-    """
+@dataclass
+class SynthesizerConfig:
+    """Paths for the wiki vault and optional Gemini API key (from env if omitted)."""
 
-    def compose(self) -> ComposeResult:
-        yield Header()
+    root: Path = field(default_factory=lambda: Path(__file__).parent.parent.resolve())
+    gemini_key: str | None = None
 
-        yield RichLog(id="output-box", highlight=True, markup=True)
+    def __post_init__(self) -> None:
+        if self.gemini_key is None:
+            self.gemini_key = os.environ.get("GEMINI_KEY")
 
-        with Vertical(id="menu-box"):
-            yield OptionList(
-                Option("1. List Raw Notes", id="list_raw"),
-                Option("2. Synthesize Raw Notes", id="synth_raw"),
-                Option("3. Exit System", id="exit"),
-                id="menu"
+    @property
+    def raw_dir(self) -> Path:
+        return self.root / "raw"
+
+    @property
+    def concepts_dir(self) -> Path:
+        return self.root / "concepts"
+
+    @property
+    def wiki_dir(self) -> Path:
+        return self.root / "wiki"
+
+
+# --- JSON parsing (LLM output) ---
+
+
+class LlmJsonParser:
+    """Parse JSON from Gemini responses (fences, preamble, trailing junk)."""
+
+    @staticmethod
+    def strip_outer_code_fence(text: str) -> str:
+        """Remove a single leading ``` / ```json fence and matching trailing ``` only."""
+        text = text.strip()
+        if not text.startswith("```"):
+            return text
+        first_nl = text.find("\n")
+        if first_nl == -1:
+            return text
+        body = text[first_nl + 1 :].rstrip()
+        if body.endswith("```"):
+            body = body[:-3].rstrip()
+        return body.strip()
+
+    @staticmethod
+    def parse_json_from_llm(text: str):
+        """
+        Parse the first JSON object or array from model output.
+        Handles preamble text, optional markdown fences, and trailing junk after valid JSON.
+        """
+        normalized = LlmJsonParser.strip_outer_code_fence(text.strip())
+
+        try:
+            return json.loads(normalized)
+        except json.JSONDecodeError:
+            pass
+
+        start = next((i for i, c in enumerate(normalized) if c in "[{"), None)
+        if start is None:
+            raise json.JSONDecodeError(
+                "No JSON object or array found in model output", normalized, 0
             )
 
-        yield Footer()
+        decoder = json.JSONDecoder()
+        obj, _ = decoder.raw_decode(normalized, start)
+        return obj
 
-    def on_mount(self) -> None:
-        """Sets focus to the menu as soon as the app starts."""
-        self.theme = "dracula"
-        self.query_one("#menu").focus()
-
-    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        """Called when user highlights an option and presses Enter."""
-        option_id = event.option.id
-        
-        if option_id is None:
-            return
-        
-        # Mapping IDs to specific function calls
-        actions = {
-            "list_raw": self.list_raw_notes,
-            "synth_raw": self.synthesize_raw_notes,
-            "exit": self.exit_app
-        }
-        
-        action_func = actions.get(option_id)
-        if action_func:
-            action_func()
-
-    def list_raw_notes(self):
-        out = self.query_one("#output-box", RichLog)
-        out.write("Listing raw notes...")
-
-        raw_path = Path(RAW_DIR)
-        if not raw_path.exists() or not raw_path.is_dir():
-            out.write(f"Raw directory not found: {RAW_DIR}")
-            return
-        
-        raw_md_files = sorted(f for f in raw_path.iterdir() if f.is_file() and f.suffix == ".md")
-        if not raw_md_files:
-            out.write(f"No .md files found in the raw directory: {RAW_DIR}.")
-            return
-        
-        for file in raw_md_files:
-            out.write(f"RAW -> {file.name}")
-
-    
-    def synthesize_raw_notes(self):
-        out = self.query_one("#output-box", RichLog)
-        out.write("Starting synthesis of raw notes...")
-        manual_synth()
-
-    def exit_app(self):
-        self.exit()
-        
-
-# --- 3. CORE FUNCTIONS ---
-
-def strip_outer_code_fence(text: str) -> str:
-    """Remove a single leading ``` / ```json fence and matching trailing ``` only."""
-    text = text.strip()
-    if not text.startswith("```"):
-        return text
-    first_nl = text.find("\n")
-    if first_nl == -1:
-        return text
-    body = text[first_nl + 1 :].rstrip()
-    if body.endswith("```"):
-        body = body[:-3].rstrip()
-    return body.strip()
+    @staticmethod
+    def normalize_synthesis_parsed(parsed_data) -> dict:
+        """Accept {concepts: [...]}, a bare array, or a single concept object."""
+        if isinstance(parsed_data, list):
+            return {"concepts": parsed_data}
+        if isinstance(parsed_data, dict):
+            if "concepts" in parsed_data:
+                return parsed_data
+            if "title" in parsed_data:
+                return {"concepts": [parsed_data]}
+        return parsed_data
 
 
-def parse_json_from_llm(text: str):
-    """
-    Parse the first JSON object or array from model output.
-    Handles preamble text, optional markdown fences, and trailing junk after valid JSON.
-    """
-    normalized = strip_outer_code_fence(text.strip())
-
-    try:
-        return json.loads(normalized)
-    except json.JSONDecodeError:
-        pass
-
-    start = next((i for i, c in enumerate(normalized) if c in "[{"), None)
-    if start is None:
-        raise json.JSONDecodeError("No JSON object or array found in model output", normalized, 0)
-
-    decoder = json.JSONDecoder()
-    obj, _ = decoder.raw_decode(normalized, start)
-    return obj
+# --- Tags ---
 
 
-def list_raw_markdown_files() -> List[str]:
-    """Sorted list of *.md basenames under RAW_DIR."""
-    if not os.path.isdir(RAW_DIR):
-        return []
-    return sorted(f for f in os.listdir(RAW_DIR) if f.endswith(".md"))
+class TagUtils:
+    """Normalize tags and build Obsidian link lines."""
+
+    @staticmethod
+    def normalize_list(tags: List[str]) -> List[str]:
+        """Lowercase slug tags, dedupe preserving order; allow a-z 0-9 hyphen."""
+        seen: Set[str] = set()
+        out: List[str] = []
+        for raw in tags:
+            t = (raw or "").strip().lstrip("#").lower()
+            t = re.sub(r"[^a-z0-9-]+", "-", t).strip("-")
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
+        return out
+
+    @staticmethod
+    def links_markdown(tags: List[str]) -> str:
+        """Single-line Obsidian links block after normalized tags."""
+        norm = TagUtils.normalize_list(tags)
+        if not norm:
+            return ""
+        return "Links: " + " ".join([f"[[{t}]]" for t in norm]) + "\n\n"
 
 
-def load_raw_file_contents(filename: str) -> str:
-    """Read one raw markdown file; filename must be a basename under RAW_DIR."""
-    filepath = os.path.join(RAW_DIR, filename)
-    with open(filepath, "r", encoding="utf-8") as f:
-        return f.read()
+# --- Filesystem ---
 
 
-def safe_filename_stem_from_raw(filename: str) -> str:
-    """Slug from raw filename (no path) for output, e.g. 'My Note.md' -> 'my_note'."""
-    stem = filename[:-3] if filename.lower().endswith(".md") else filename
-    s = "".join(c for c in stem.lower() if c.isalnum() or c in (" ", "_")).replace(" ", "_")
-    return s if s else "note"
+class WikiRepository:
+    """Raw notes and concept markdown under a configured vault root."""
 
+    def __init__(self, config: SynthesizerConfig) -> None:
+        self._config = config
 
-def normalize_synthesis_parsed(parsed_data) -> dict:
-    """Accept {concepts: [...]}, a bare array, or a single concept object."""
-    if isinstance(parsed_data, list):
-        return {"concepts": parsed_data}
-    if isinstance(parsed_data, dict):
-        if "concepts" in parsed_data:
-            return parsed_data
-        if "title" in parsed_data:
-            return {"concepts": [parsed_data]}
-    return parsed_data
+    def list_raw_markdown_files(self) -> List[str]:
+        """Sorted list of *.md basenames under raw_dir (not recursive)."""
+        d = self._config.raw_dir
+        if not d.is_dir():
+            return []
+        return sorted(f for f in os.listdir(d) if f.endswith(".md"))
 
+    def load_raw_file_contents(self, filename: str) -> str:
+        """Read one raw markdown file; filename must be a basename under raw_dir."""
+        filepath = self._config.raw_dir / filename
+        with open(filepath, "r", encoding="utf-8") as f:
+            return f.read()
 
-def collect_existing_tags(concepts_dir: str) -> Set[str]:
-    """
-    Scan *.md under concepts_dir. The first non-empty line of each file may be
-    'TAGS: #a #b ...' (case-insensitive). Parse hashtags and merge into a set.
-    If the first non-empty line is not TAGS:, that file contributes no tags.
-    """
-    found: Set[str] = set()
-    if not os.path.isdir(concepts_dir):
+    @staticmethod
+    def safe_filename_stem_from_raw(filename: str) -> str:
+        """Slug from raw filename (no path) for output, e.g. 'My Note.md' -> 'my_note'."""
+        stem = filename[:-3] if filename.lower().endswith(".md") else filename
+        s = "".join(c for c in stem.lower() if c.isalnum() or c in (" ", "_")).replace(
+            " ", "_"
+        )
+        return s if s else "note"
+
+    def collect_existing_tags(self) -> Set[str]:
+        """
+        Scan *.md under concepts_dir. The first non-empty line of each file may be
+        'TAGS: #a #b ...' (case-insensitive). Parse hashtags and merge into a set.
+        """
+        found: Set[str] = set()
+        concepts_dir = self._config.concepts_dir
+        if not concepts_dir.is_dir():
+            return found
+        for name in os.listdir(concepts_dir):
+            if not name.endswith(".md"):
+                continue
+            path = concepts_dir / name
+            try:
+                with open(path, encoding="utf-8") as f:
+                    for line in f:
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        m = re.match(r"^TAGS:\s*(.*)$", stripped, re.IGNORECASE)
+                        if m:
+                            for raw in m.group(1).split():
+                                tok = raw.lstrip("#").lower()
+                                if tok:
+                                    found.add(tok)
+                        break
+            except OSError:
+                continue
         return found
-    for name in os.listdir(concepts_dir):
-        if not name.endswith(".md"):
-            continue
-        path = os.path.join(concepts_dir, name)
-        try:
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    m = re.match(r"^TAGS:\s*(.*)$", stripped, re.IGNORECASE)
-                    if m:
-                        for raw in m.group(1).split():
-                            tok = raw.lstrip("#").lower()
-                            if tok:
-                                found.add(tok)
-                    break
-        except OSError:
-            continue
-    return found
 
-
-def normalize_tag_list(tags: List[str]) -> List[str]:
-    """Lowercase slug tags, dedupe preserving order; allow a-z 0-9 hyphen."""
-    seen: Set[str] = set()
-    out: List[str] = []
-    for raw in tags:
-        t = (raw or "").strip().lstrip("#").lower()
-        t = re.sub(r"[^a-z0-9-]+", "-", t).strip("-")
-        if not t or t in seen:
-            continue
-        seen.add(t)
-        out.append(t)
-    return out
-
-
-def generate_tag_links(tags: List[str]) -> str:
-    """Generates a single-line string of Obsidian links based on normalized tags."""
-    norm = normalize_tag_list(tags)
-    if not norm:
-        return ""
-    # Format: Links: [[tag1]] [[tag2]] ... followed by two newlines for separation from body content.
-    links = "Links: " + " ".join([f"[[{t}]]" for t in norm]) + "\n\n"
-    return links
-
-
-def call_gemini_api(
-    context_data: str,
-    system_prompt: str,
-    existing_tags: Set[str] | None = None,
-    *,
-    source_label: str | None = None,
-) -> SynthesisOutput | None:
-    """Sends the prompt to Gemini API and attempts to parse the structured response."""
-    label = f" ({source_label})" if source_label else ""
-    log.info(f"  -> Calling Gemini API{label}...", color=Colors.CYAN)
-    existing_tags = existing_tags or set()
-    if existing_tags:
-        tag_section = (
-            "\n\nExisting tags already used in this vault (reuse when relevant): "
-            + ", ".join(sorted(existing_tags))
-            + "\n"
+    def write_concept_file(self, concept: Concept, output_stem: str) -> None:
+        """Write one concept to concepts_dir/{output_stem}.md."""
+        concepts_dir = self._config.concepts_dir
+        concepts_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{output_stem}.md"
+        filepath = concepts_dir / filename
+        tags_line = "TAGS: " + " ".join(
+            f"#{t}" for t in TagUtils.normalize_list(concept.tags)
         )
-    else:
-        tag_section = (
-            "\n\nNo existing tags have been recorded in concept notes yet; "
-            "introduce sensible new tags as needed.\n"
-        )
-    full_system_prompt = system_prompt + tag_section
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(tags_line + "\n\n")
+            f.write(TagUtils.links_markdown(concept.tags))
+            f.write(concept.summary_markdown)
+        log.info(f"  -> Wrote {filename} ({concept.title})", color=Colors.GREEN)
 
-    # The user message is just the context data
-    user_message = f"CONTEXT DATA:\n{context_data}"
 
-    headers = {"Content-Type": "application/json"}
-    
-    payload = {
-        "systemInstruction": {
-            "parts": [{"text": full_system_prompt}]
-        },
-        "contents": [{
-            "parts": [{"text": user_message}]
-        }],
-        "generationConfig": {
-            "temperature": 0.1,
-            "responseMimeType": "application/json"
-        }
-    }
+# --- Gemini API ---
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
 
-    try:
-        response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status() 
-        
-        data = response.json()
-        llm_text = data['candidates'][0]['content']['parts'][0]['text']
+class GeminiSynthesisClient:
+    """Call Gemini generateContent and return structured SynthesisOutput."""
 
-        log.info("  -> Received raw text from LLM. Attempting structured parsing...", color=Colors.CYAN)
-        try:
-            parsed_data = parse_json_from_llm(llm_text)
-            parsed_data = normalize_synthesis_parsed(parsed_data)
-            return SynthesisOutput(**parsed_data)
-        except json.JSONDecodeError as e:
-            log.warning("PARSING FAILED: Could not parse JSON from the model response.")
-            log.warning(f"   {e.msg} (at char {getattr(e, 'pos', '?')})")
-            if e.doc and isinstance(e.doc, str) and getattr(e, "pos", None) is not None:
-                pos = min(e.pos, len(e.doc))
-                lo = max(0, pos - 80)
-                hi = min(len(e.doc), pos + 80)
-                log.warning("   Context around error: %r", e.doc[lo:hi])
-            else:
-                log.warning("   Raw LLM Output Snippet: %s", llm_text[:800])
+    def __init__(self, config: SynthesizerConfig) -> None:
+        self._config = config
+
+    def generate(
+        self,
+        context_data: str,
+        system_prompt: str,
+        existing_tags: Set[str] | None = None,
+        *,
+        source_label: str | None = None,
+    ) -> SynthesisOutput | None:
+        """Send the prompt to Gemini API and parse the structured response."""
+        key = self._config.gemini_key
+        if not key:
+            log.error("GEMINI_KEY is not set.")
             return None
 
-    except requests.exceptions.RequestException as e:
-        log.error(
-            "API CONNECTION ERROR: Could not connect to Gemini API."
-        )
-        if hasattr(e, "response") and e.response is not None:
-            log.error(f"   Response status: {e.response.status_code}. Detail: {e.response.text}")
+        label = f" ({source_label})" if source_label else ""
+        log.info(f"  -> Calling Gemini API{label}...", color=Colors.CYAN)
+        existing_tags = existing_tags or set()
+        if existing_tags:
+            tag_section = (
+                "\n\nExisting tags already used in this vault (reuse when relevant): "
+                + ", ".join(sorted(existing_tags))
+                + "\n"
+            )
         else:
-            log.error(f"   Error: {e}")
-        return None
+            tag_section = (
+                "\n\nNo existing tags have been recorded in concept notes yet; "
+                "introduce sensible new tags as needed.\n"
+            )
+        full_system_prompt = system_prompt + tag_section
+        user_message = f"CONTEXT DATA:\n{context_data}"
+
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "systemInstruction": {"parts": [{"text": full_system_prompt}]},
+            "contents": [{"parts": [{"text": user_message}]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json",
+            },
+        }
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-2.5-flash:generateContent?key={key}"
+        )
+
+        try:
+            response = requests.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+
+            data = response.json()
+            llm_text = data["candidates"][0]["content"]["parts"][0]["text"]
+
+            log.info(
+                "  -> Received raw text from LLM. Attempting structured parsing...",
+                color=Colors.CYAN,
+            )
+            try:
+                parsed_data = LlmJsonParser.parse_json_from_llm(llm_text)
+                parsed_data = LlmJsonParser.normalize_synthesis_parsed(parsed_data)
+                return SynthesisOutput(**parsed_data)
+            except json.JSONDecodeError as e:
+                log.warning("PARSING FAILED: Could not parse JSON from the model response.")
+                log.warning(f"   {e.msg} (at char {getattr(e, 'pos', '?')})")
+                if e.doc and isinstance(e.doc, str) and getattr(e, "pos", None) is not None:
+                    pos = min(e.pos, len(e.doc))
+                    lo = max(0, pos - 80)
+                    hi = min(len(e.doc), pos + 80)
+                    log.warning("   Context around error: %r", e.doc[lo:hi])
+                else:
+                    log.warning("   Raw LLM Output Snippet: %s", llm_text[:800])
+                return None
+
+        except requests.exceptions.RequestException as e:
+            log.error("API CONNECTION ERROR: Could not connect to Gemini API.")
+            if hasattr(e, "response") and e.response is not None:
+                log.error(
+                    f"   Response status: {e.response.status_code}. Detail: {e.response.text}"
+                )
+            else:
+                log.error(f"   Error: {e}")
+            return None
 
 
-def write_concept_file(concept: Concept, output_stem: str) -> None:
-    """Write one concept to CONCEPTS_DIR/{output_stem}.md (stem is slug, no extension)."""
-    if not os.path.exists(CONCEPTS_DIR):
-        os.mkdir(CONCEPTS_DIR)
-    filename = f"{output_stem}.md"
-    filepath = os.path.join(CONCEPTS_DIR, filename)
-    with open(filepath, "w", encoding="utf-8") as f:
-        # 1. Write Tags (using the old format for consistency with existing files)
-        f.write("TAGS: " + " ".join(f"#{t}" for t in normalize_tag_list(concept.tags)) + "\n\n")
-        # 2. Write Obsidian Links based on tags
-        f.write(generate_tag_links(concept.tags))
-        # 3. Write the main summary content
-        f.write(concept.summary_markdown)
-    log.info(f"  -> Wrote {filename} ({concept.title})", color=Colors.GREEN)
+# --- Orchestration ---
 
 
-# --- 4. MAIN EXECUTION BLOCK ---
-
-def manual_synth():
-    setup_logging()
-
-    # One raw .md file -> one API call -> exactly one concept -> one file in CONCEPTS_DIR
-    # Output filename is derived from the raw filename (e.g. foo.md -> foo.md in concepts).
+class WikiSynthesizer:
+    """
+    One raw .md file -> one API call -> one concept -> one file in concepts_dir;
+    then move raw file to raw/processed/.
+    """
 
     SYSTEM_PROMPT = """
         You are a Master Knowledge Synthesizer Agent for an Obsidian Wiki. You are given ONE raw Markdown document (see CONTEXT DATA).
@@ -374,68 +342,87 @@ def manual_synth():
         The Output must adhere strictly to JSON format and must be parseable as a json document.
     """
 
-    if not os.path.isdir(RAW_DIR):
-        log.error("Raw directory not found: %s", RAW_DIR)
-        exit(1)
+    def __init__(self, config: SynthesizerConfig | None = None) -> None:
+        self.config = config or SynthesizerConfig()
+        self.repo = WikiRepository(self.config)
+        self.gemini = GeminiSynthesisClient(self.config)
 
-    existing_tags = collect_existing_tags(CONCEPTS_DIR)
-    log.info(f"Existing vault tags from [concepts]: {len(existing_tags)} tags found", color=Colors.GREEN)
+    def run_manual_batch(self) -> None:
+        """Process every *.md in raw_dir (CLI-style batch)."""
+        setup_logging()
 
-    raw_files = list_raw_markdown_files()
-    if not raw_files:
-        log.error("No .md files in %s", RAW_DIR)
-        exit(1)
+        if not self.config.gemini_key:
+            log.error(
+                "GEMINI_KEY environment variable is not set. Please export it before running."
+            )
+            raise SystemExit(1)
 
-    log.info(f"Processing {len(raw_files)} raw file(s), one concept per file", color=Colors.CYAN)
+        raw_dir = self.config.raw_dir
+        if not raw_dir.is_dir():
+            log.error("Raw directory not found: %s", raw_dir)
+            raise SystemExit(1)
 
-    for raw_name in raw_files:
-        log.info(f"  -> Processing RAW: {raw_name}", color=Colors.GREEN)
-        try:
-            body = load_raw_file_contents(raw_name)
-        except OSError as e:
-            log.error("  -> Could not read file: %s", e)
-            continue
-
-        context = f"SOURCE FILE: {raw_name}\n\n{body}"
-        synthesis_result = call_gemini_api(
-            context,
-            SYSTEM_PROMPT,
-            existing_tags,
-            source_label=raw_name,
+        existing_tags = self.repo.collect_existing_tags()
+        log.info(
+            f"Existing vault tags from [concepts]: {len(existing_tags)} tags found",
+            color=Colors.GREEN,
         )
 
-        if not synthesis_result or not synthesis_result.concepts:
-            log.warning("\tNo concept produced; skipping.")
-            continue
+        raw_files = self.repo.list_raw_markdown_files()
+        if not raw_files:
+            log.error("No .md files in %s", raw_dir)
+            raise SystemExit(1)
 
-        if len(synthesis_result.concepts) > 1:
-            log.warning(
-                f"\tModel returned {len(synthesis_result.concepts)} concepts; "
-                "using only the first for one-to-one mode.",
+        log.info(
+            f"Processing {len(raw_files)} raw file(s), one concept per file",
+            color=Colors.CYAN,
+        )
+
+        for raw_name in raw_files:
+            log.info(f"  -> Processing RAW: {raw_name}", color=Colors.GREEN)
+            try:
+                body = self.repo.load_raw_file_contents(raw_name)
+            except OSError as e:
+                log.error("  -> Could not read file: %s", e)
+                continue
+
+            context = f"SOURCE FILE: {raw_name}\n\n{body}"
+            synthesis_result = self.gemini.generate(
+                context,
+                self.SYSTEM_PROMPT,
+                existing_tags,
+                source_label=raw_name,
             )
 
-        concept = synthesis_result.concepts[0]
-        out_stem = safe_filename_stem_from_raw(raw_name)
-        write_concept_file(concept, output_stem=out_stem)
+            if not synthesis_result or not synthesis_result.concepts:
+                log.warning("\tNo concept produced; skipping.")
+                continue
 
-        try:
-            # Define and create target directory
-            target_dir = os.path.join(RAW_DIR, "processed")
-            os.makedirs(target_dir, exist_ok=True)
+            if len(synthesis_result.concepts) > 1:
+                log.warning(
+                    f"\tModel returned {len(synthesis_result.concepts)} concepts; "
+                    "using only the first for one-to-one mode.",
+                )
 
-            # Move the original raw file
-            src_path = os.path.join(RAW_DIR, raw_name)
-            destination_path = os.path.join(target_dir, raw_name)
-            shutil.move(src_path, destination_path)
-        except OSError as e:
-            log.warning("   OS Error during file move for %s: %s", raw_name, e)
+            concept = synthesis_result.concepts[0]
+            out_stem = WikiRepository.safe_filename_stem_from_raw(raw_name)
+            self.repo.write_concept_file(concept, output_stem=out_stem)
 
-        for t in normalize_tag_list(concept.tags) or ["wiki"]:
-            existing_tags.add(t)
+            try:
+                target_dir = raw_dir / "processed"
+                target_dir.mkdir(parents=True, exist_ok=True)
+                src_path = raw_dir / raw_name
+                shutil.move(str(src_path), str(target_dir / raw_name))
+            except OSError as e:
+                log.warning("   OS Error during file move for %s: %s", raw_name, e)
 
-    log.info("\nSynthesis run finished.")
+            for t in TagUtils.normalize_list(concept.tags) or ["wiki"]:
+                existing_tags.add(t)
+
+        log.info("\nSynthesis run finished.")
+
 
 if __name__ == "__main__":
-    #app = SynthApp()
-    #app.run()
-    manual_synth()
+    from ui_qt import run_app
+
+    run_app()
