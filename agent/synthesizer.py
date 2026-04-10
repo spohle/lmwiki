@@ -15,6 +15,7 @@ from logutil import Colors, get_logger, setup_logging
 
 log = get_logger(__name__)
 
+# Desktop app entry: run `python lmwiki.py` from the repository root (not this file).
 
 # --- Data models (Pydantic) ---
 
@@ -39,10 +40,6 @@ class SynthesisOutput(BaseModel):
         description="exactly one concept when synthesizing a single raw document; array must hold one object",
     )
 
-
-# --- Configuration ---
-
-
 @dataclass
 class SynthesizerConfig:
     """Paths for the wiki vault and optional Gemini API key (from env if omitted)."""
@@ -65,10 +62,6 @@ class SynthesizerConfig:
     @property
     def wiki_dir(self) -> Path:
         return self.root / "wiki"
-
-
-# --- JSON parsing (LLM output) ---
-
 
 class LlmJsonParser:
     """Parse JSON from Gemini responses (fences, preamble, trailing junk)."""
@@ -123,9 +116,6 @@ class LlmJsonParser:
         return parsed_data
 
 
-# --- Tags ---
-
-
 class TagUtils:
     """Normalize tags and build Obsidian link lines."""
 
@@ -152,14 +142,15 @@ class TagUtils:
         return "Links: " + " ".join([f"[[{t}]]" for t in norm]) + "\n\n"
 
 
-# --- Filesystem ---
-
-
 class WikiRepository:
     """Raw notes and concept markdown under a configured vault root."""
 
     def __init__(self, config: SynthesizerConfig) -> None:
         self._config = config
+
+    @property
+    def raw_dir(self) -> Path:
+        return self._config.raw_dir
 
     def list_raw_markdown_files(self) -> List[str]:
         """Sorted list of *.md basenames under raw_dir (not recursive)."""
@@ -420,9 +411,3 @@ class WikiSynthesizer:
                 existing_tags.add(t)
 
         log.info("\nSynthesis run finished.")
-
-
-if __name__ == "__main__":
-    from ui_qt import run_app
-
-    run_app()
