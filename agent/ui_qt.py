@@ -43,6 +43,7 @@ from ui_stylesheet import APPLICATION_STYLESHEET
 from window_log import QtPanelLogHandler, WindowLog
 
 _RAW_LIST_BG = QColor("#282c34")
+_RAW_LIST_BG_ALT = QColor("#2c313a")
 _RAW_LIST_FG = QColor("#abb2bf")
 _RAW_LIST_SEL_BG = QColor("#e06c75")
 _RAW_LIST_SEL_FG = QColor("#000000")
@@ -431,18 +432,19 @@ class MainWindow(QMainWindow):
     def _apply_raw_list_row_colors(self) -> None:
         if self._raw_file_list is None:
             return
+        normal_icon, sel_icon = _raw_list_bullet_icons()
         for i in range(self._raw_file_list.count()):
             it = self._raw_file_list.item(i)
             if it is None:
                 continue
             n = it.text()
-            normal_icon, sel_icon = _raw_list_bullet_icons()
             if n in self._raw_selected:
                 it.setBackground(QBrush(_RAW_LIST_SEL_BG))
                 it.setForeground(QBrush(_RAW_LIST_SEL_FG))
                 it.setIcon(sel_icon)
             else:
-                it.setBackground(QBrush(_RAW_LIST_BG))
+                stripe = _RAW_LIST_BG if i % 2 == 0 else _RAW_LIST_BG_ALT
+                it.setBackground(QBrush(stripe))
                 it.setForeground(QBrush(_RAW_LIST_FG))
                 it.setIcon(normal_icon)
 
