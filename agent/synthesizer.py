@@ -19,6 +19,18 @@ log = get_logger(__name__)
 
 # Desktop app entry: run `python lmwiki.py` from the repository root (not this file).
 
+# Top-level raw/ inputs (not recursive); concept output is always .md under concepts/.
+_RAW_SOURCE_SUFFIXES: tuple[str, ...] = (".md", ".txt")
+# Companion assets: same dir, basename `{raw_stem}_<suffix>.<ext>` (raw_stem = filename without .md/.txt).
+_IMAGE_EXTENSIONS: tuple[str, ...] = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".svg",
+)
+
 
 class SynthesisCancelled(Exception):
     """Raised when cancel_check is true during Gemini retries or backoff wait."""
@@ -158,23 +170,56 @@ class WikiRepository:
     def raw_dir(self) -> Path:
         return self._config.raw_dir
 
-    def list_raw_markdown_files(self) -> List[str]:
-        """Sorted list of *.md basenames under raw_dir (not recursive)."""
+    def list_raw_source_files(self) -> List[str]:
+        """Sorted list of *.md and *.txt basenames under raw_dir (not recursive)."""
         d = self._config.raw_dir
         if not d.is_dir():
             return []
-        return sorted(f for f in os.listdir(d) if f.endswith(".md"))
+        return sorted(
+            f
+            for f in os.listdir(d)
+            if f.lower().endswith(_RAW_SOURCE_SUFFIXES)
+        )
 
     def load_raw_file_contents(self, filename: str) -> str:
-        """Read one raw markdown file; filename must be a basename under raw_dir."""
+        """Read one raw file (.md or .txt); filename must be a basename under raw_dir."""
         filepath = self._config.raw_dir / filename
         with open(filepath, "r", encoding="utf-8") as f:
             return f.read()
 
+    def list_companion_image_basenames(self, raw_basename: str) -> List[str]:
+        """
+        Image files beside the raw source: `{Path(raw_basename).stem}_*.<image_ext>`
+        under raw_dir (top-level only), sorted alphabetically by basename.
+        """
+        d = self._config.raw_dir
+        if not d.is_dir():
+            return []
+        stem = Path(raw_basename).stem
+        prefix = f"{stem}_"
+        found: list[str] = []
+        for name in os.listdir(d):
+            path = d / name
+            if not path.is_file():
+                continue
+            low = name.lower()
+            if not any(low.endswith(ext) for ext in _IMAGE_EXTENSIONS):
+                continue
+            if not name.startswith(prefix):
+                continue
+            rest = name[len(prefix) :]
+            if "." not in rest:
+                continue
+            base_part, _ext = rest.rsplit(".", 1)
+            if not base_part:
+                continue
+            found.append(name)
+        return sorted(found)
+
     @staticmethod
     def safe_filename_stem_from_raw(filename: str) -> str:
-        """Slug from raw filename (no path) for output, e.g. 'My Note.md' -> 'my_note'."""
-        stem = filename[:-3] if filename.lower().endswith(".md") else filename
+        """Slug from raw basename for concept filename, e.g. 'My Note.md' -> 'my_note'."""
+        stem = Path(filename).stem
         s = "".join(c for c in stem.lower() if c.isalnum() or c in (" ", "_")).replace(
             " ", "_"
         )
@@ -235,9 +280,50 @@ class GeminiSynthesisClient:
     #: Failures (HTTP, parse, schema, etc.) are retried this many times after the first try.
     MAX_RETRIES = 3
     RETRY_BACKOFF_SEC = 10
+    MODEL_PRIMARY = "gemini-2.5-flash"
+    MODEL_FALLBACK = "gemini-2.5-flash-lite"
 
     def __init__(self, config: SynthesizerConfig) -> None:
         self._config = config
+
+    @staticmethod
+    def _generate_content_url(model: str, api_key: str) -> str:
+        return (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={api_key}"
+        )
+
+    @staticmethod
+    def _http_status_suggests_fallback(status_code: int) -> bool:
+        return status_code in (429, 500, 502, 503, 504)
+
+    @staticmethod
+    def _api_error_suggests_fallback(payload: dict) -> bool:
+        err = payload.get("error")
+        if not isinstance(err, dict):
+            return False
+        code = err.get("code")
+        status = err.get("status", "")
+        if isinstance(status, str) and status.upper() in (
+            "RESOURCE_EXHAUSTED",
+            "UNAVAILABLE",
+            "DEADLINE_EXCEEDED",
+        ):
+            return True
+        if code in (429, 500, 502, 503, 504):
+            return True
+        msg = str(err.get("message", "")).lower()
+        hints = (
+            "quota",
+            "rate limit",
+            "resource exhausted",
+            "too many requests",
+            "overload",
+            "unavailable",
+            "try again later",
+            "capacity",
+        )
+        return any(h in msg for h in hints)
 
     @staticmethod
     def _log_retry_countdown(
@@ -265,25 +351,65 @@ class GeminiSynthesisClient:
         headers: dict[str, str],
         payload: dict,
         label: str,
-    ) -> SynthesisOutput | None:
-        """Single HTTP round-trip + parse. Returns None on any failure."""
+    ) -> tuple[SynthesisOutput | None, bool]:
+        """
+        Single HTTP round-trip + parse.
+        Returns (output, try_fallback_model). Second element True when failure looks like
+        quota, rate limit, or model/API unavailability (caller may try secondary model).
+        """
         try:
             response = requests.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-
+            status = response.status_code
+            data: dict | None
             try:
-                data = response.json()
+                parsed = response.json()
+                data = parsed if isinstance(parsed, dict) else None
             except json.JSONDecodeError as e:
                 log.error("API body is not JSON%s: %s", label, e)
-                return None
+                return None, self._http_status_suggests_fallback(status)
+
+            if not response.ok:
+                try_fb = self._http_status_suggests_fallback(status) or (
+                    data is not None and self._api_error_suggests_fallback(data)
+                )
+                if try_fb:
+                    log.warning(
+                        "Gemini HTTP %s%s — quota/unavailable; may try fallback model. %s",
+                        status,
+                        label,
+                        (response.text[:500] + "…") if len(response.text) > 500 else response.text,
+                    )
+                else:
+                    log.error(
+                        "Gemini HTTP %s%s: %s",
+                        status,
+                        label,
+                        response.text[:800],
+                    )
+                return None, try_fb
+
+            if data is None:
+                log.error("Gemini response JSON was not an object%s.", label)
+                return None, False
+
+            if "error" in data:
+                try_fb = self._api_error_suggests_fallback(data)
+                if try_fb:
+                    log.warning(
+                        "Gemini error payload%s (quota/unavailable); may try fallback: %s",
+                        label,
+                        data.get("error"),
+                    )
+                else:
+                    log.error("Gemini error in response body%s: %s", label, data.get("error"))
+                return None, try_fb
 
             try:
                 llm_text = data["candidates"][0]["content"]["parts"][0]["text"]
             except (KeyError, IndexError, TypeError) as e:
                 log.error("Unexpected Gemini response shape%s: %s", label, e)
-                if isinstance(data, dict):
-                    log.error("   Top-level keys: %s", list(data.keys()))
-                return None
+                log.error("   Top-level keys: %s", list(data.keys()))
+                return None, False
 
             log.info(
                 "  -> Received raw text from LLM. Attempting structured parsing...",
@@ -306,23 +432,26 @@ class GeminiSynthesisClient:
                     log.error("   Context around error: %r", e.doc[lo:hi])
                 else:
                     log.error("   Raw LLM output snippet: %s", llm_text[:800])
-                return None
+                return None, False
 
             try:
-                return SynthesisOutput(**parsed_data)
+                return SynthesisOutput(**parsed_data), False
             except ValidationError as e:
                 log.error("Schema validation failed on model JSON%s: %s", label, e)
-                return None
+                return None, False
 
         except requests.exceptions.RequestException as e:
-            log.error("API CONNECTION ERROR: Could not connect to Gemini API.")
+            log.error("API CONNECTION ERROR: Could not connect to Gemini API%s.", label)
             if hasattr(e, "response") and e.response is not None:
+                sc = e.response.status_code
                 log.error(
-                    f"   Response status: {e.response.status_code}. Detail: {e.response.text}"
+                    "   Response status: %s. Detail: %s",
+                    sc,
+                    e.response.text[:800],
                 )
-            else:
-                log.error(f"   Error: {e}")
-            return None
+                return None, self._http_status_suggests_fallback(sc)
+            log.error("   Error: %s", e)
+            return None, False
 
     def generate(
         self,
@@ -364,10 +493,8 @@ class GeminiSynthesisClient:
                 "responseMimeType": "application/json",
             },
         }
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.5-flash:generateContent?key={key}"
-        )
+        url_primary = self._generate_content_url(self.MODEL_PRIMARY, key)
+        url_fallback = self._generate_content_url(self.MODEL_FALLBACK, key)
 
         max_attempts = 1 + self.MAX_RETRIES
         for attempt in range(1, max_attempts + 1):
@@ -375,12 +502,27 @@ class GeminiSynthesisClient:
                 log.warning("  -> Gemini attempt cancelled before try%s.", label)
                 raise SynthesisCancelled
             log.info(
-                f"  -> Gemini API{label} attempt {attempt}/{max_attempts}…",
+                f"  -> Gemini API{label} attempt {attempt}/{max_attempts} "
+                f"({self.MODEL_PRIMARY} then {self.MODEL_FALLBACK} if needed)…",
                 color=Colors.CYAN,
             )
-            result = self._execute_generate_attempt(url, headers, payload, label)
+            sub_primary = f"{label} [{self.MODEL_PRIMARY}]"
+            result, try_fallback = self._execute_generate_attempt(
+                url_primary, headers, payload, sub_primary
+            )
             if result is not None:
                 return result
+            if try_fallback:
+                log.info(
+                    f"  -> Primary model unavailable or limited; trying {self.MODEL_FALLBACK}{label}…",
+                    color=Colors.CYAN,
+                )
+                sub_fb = f"{label} [{self.MODEL_FALLBACK}]"
+                result_fb, _ = self._execute_generate_attempt(
+                    url_fallback, headers, payload, sub_fb
+                )
+                if result_fb is not None:
+                    return result_fb
             if attempt >= max_attempts:
                 log.error(
                     "  -> Gemini failed after %s attempt(s)%s; giving up.",
@@ -411,15 +553,16 @@ class GeminiSynthesisClient:
 
 class WikiSynthesizer:
     """
-    One raw .md file -> one API call -> one concept -> one file in concepts_dir;
-    then move raw file to raw/processed/.
+    One raw .md or .txt file -> one API call -> one concept -> one file in concepts_dir;
+    companion images (same stem + _*) move to concepts_dir with the .md; raw source moves to raw/processed/.
     """
 
     SYSTEM_PROMPT = """
-        You are a Master Knowledge Synthesizer Agent for an Obsidian Wiki. You are given ONE raw Markdown document (see CONTEXT DATA).
+        You are a Master Knowledge Synthesizer Agent for an Obsidian Wiki. You are given ONE raw document (Markdown or plain text; see CONTEXT DATA).
         Produce exactly ONE synthesized knowledge concept for this document only in JSON format.
         Do not ommit important info in the original markdown. Keep it mostly intact when info is important.
         Your output MUST strictly adhere to the provided JSON schema. Do not include any conversational text outside of the final JSON object.
+        Do not add Obsidian image embeds (![[...]]) for companion screenshot files; those are appended automatically from files next to the source.
         The 'concepts' array MUST contain exactly one object, with:
         1. 'title': a concise title for the core idea in this document.
         2. 'summary_markdown': a complete, high-quality Obsidian-ready Markdown article for this concept. Use [[Wikilinks]] where helpful. Do not include a TAGS line in summary_markdown; tags belong only in the 'tags' array.
@@ -433,7 +576,7 @@ class WikiSynthesizer:
         self.gemini = GeminiSynthesisClient(self.config)
 
     def run_manual_batch(self) -> None:
-        """Process every *.md in raw_dir (CLI-style batch)."""
+        """Process every *.md and *.txt in raw_dir (CLI-style batch)."""
         setup_logging()
 
         if not self.config.gemini_key:
@@ -447,9 +590,9 @@ class WikiSynthesizer:
             log.error("Raw directory not found: %s", raw_dir)
             raise SystemExit(1)
 
-        raw_files = self.repo.list_raw_markdown_files()
+        raw_files = self.repo.list_raw_source_files()
         if not raw_files:
-            log.error("No .md files in %s", raw_dir)
+            log.error("No .md or .txt files in %s", raw_dir)
             raise SystemExit(1)
 
         self.process_raw_files(raw_files)
@@ -463,7 +606,7 @@ class WikiSynthesizer:
         cancel_check: Callable[[], bool] | None = None,
     ) -> None:
         """
-        Synthesize each listed raw markdown basename (top-level raw/ only).
+        Synthesize each listed raw basename (.md or .txt, top-level raw/ only).
         Skips duplicates (first occurrence wins). Logs and returns if nothing to do.
         If cancel_check is set and returns True before a file, stops after the previous
         file (current in-flight API call is not aborted).
@@ -502,7 +645,7 @@ class WikiSynthesizer:
             color=Colors.CYAN,
         )
 
-        available = set(self.repo.list_raw_markdown_files())
+        available = set(self.repo.list_raw_source_files())
         total = len(ordered_unique)
         for idx, raw_name in enumerate(ordered_unique, start=1):
             if cancel_check is not None and cancel_check():
@@ -515,7 +658,7 @@ class WikiSynthesizer:
                 break
             if raw_name not in available:
                 log.warning(
-                    "[%s/%s] Skip %r: not in raw directory or not .md",
+                    "[%s/%s] Skip %r: not in raw directory or not .md/.txt",
                     idx,
                     total,
                     raw_name,
@@ -578,6 +721,17 @@ class WikiSynthesizer:
                 )
 
             concept = synthesis_result.concepts[0]
+            companion_images = self.repo.list_companion_image_basenames(raw_name)
+            if companion_images:
+                tail = "\n".join(f"![[{b}]]" for b in companion_images)
+                concept = concept.model_copy(
+                    update={
+                        "summary_markdown": concept.summary_markdown.rstrip()
+                        + "\n\n"
+                        + tail
+                    }
+                )
+
             out_stem = WikiRepository.safe_filename_stem_from_raw(raw_name)
             out_path = self.config.concepts_dir / f"{out_stem}.md"
             try:
@@ -595,6 +749,23 @@ class WikiSynthesizer:
 
             for t in TagUtils.normalize_list(concept.tags) or ["wiki"]:
                 existing_tags.add(t)
+
+            concepts_dir = self.config.concepts_dir
+            concepts_dir.mkdir(parents=True, exist_ok=True)
+            for img_name in companion_images:
+                img_src = raw_dir / img_name
+                if not img_src.is_file():
+                    continue
+                try:
+                    shutil.move(str(img_src), str(concepts_dir / img_name))
+                except OSError as img_err:
+                    log.error(
+                        "[%s/%s] Move companion image to concepts failed for %s: %s",
+                        idx,
+                        total,
+                        img_name,
+                        img_err,
+                    )
 
             processed_path = raw_dir / "processed" / raw_name
             move_ok = False
@@ -615,12 +786,18 @@ class WikiSynthesizer:
                 )
 
             if move_ok:
+                img_note = (
+                    f"; moved {len(companion_images)} image(s) to {concepts_dir}"
+                    if companion_images
+                    else ""
+                )
                 log.info(
-                    "[%s/%s] Finished %s: wrote %s; moved raw to %s",
+                    "[%s/%s] Finished %s: wrote %s%s; moved raw to %s",
                     idx,
                     total,
                     raw_name,
                     out_path,
+                    img_note,
                     processed_path,
                     color=Colors.GREEN,
                 )

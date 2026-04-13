@@ -56,6 +56,21 @@ _RAW_LIST_BULLET_SELECTED = QColor("#1e222a")
 _raw_list_bullet_icon_cache: tuple[QIcon, QIcon] | None = None
 
 
+def _raw_list_label_with_image_count(name: str, image_count: int) -> str:
+    if image_count == 1:
+        suffix = "[1 image]"
+    else:
+        suffix = f"[{image_count} images]"
+    return f"{name} {suffix}"
+
+
+def _raw_item_basename(item: QListWidgetItem) -> str:
+    data = item.data(Qt.ItemDataRole.UserRole)
+    if isinstance(data, str) and data:
+        return data
+    return item.text()
+
+
 def _log_color_for_level(levelno: int) -> str:
     """Hex colors aligned with One Dark; stderr stays unstyled."""
     if levelno >= logging.CRITICAL:
@@ -457,7 +472,7 @@ class MainWindow(QMainWindow):
         return w
 
     def _refresh_raw_files_list(self) -> None:
-        """Load basenames from raw/ via WikiRepository.list_raw_markdown_files."""
+        """Load basenames from raw/ via WikiRepository.list_raw_source_files."""
         if self._raw_file_list is None or self._raw_status is None:
             return
         raw_dir = self._repo.raw_dir
@@ -467,18 +482,22 @@ class MainWindow(QMainWindow):
             self._raw_status.setText(f"Raw directory not found: {raw_dir}")
             self._update_synth_selected_button_state()
             return
-        names = self._repo.list_raw_markdown_files()
+        names = self._repo.list_raw_source_files()
         self._raw_selected.clear()
         self._raw_file_list.clear()
         for name in names:
-            self._raw_file_list.addItem(name)
+            n_img = len(self._repo.list_companion_image_basenames(name))
+            label = _raw_list_label_with_image_count(name, n_img)
+            it = QListWidgetItem(label)
+            it.setData(Qt.ItemDataRole.UserRole, name)
+            self._raw_file_list.addItem(it)
         self._apply_raw_list_row_colors()
         if not names:
             self._raw_status.setText(
-                f"No .md files in {raw_dir} (top-level only, excludes subfolders)."
+                f"No .md or .txt files in {raw_dir} (top-level only, excludes subfolders)."
             )
         else:
-            self._raw_status.setText(f"{len(names)} markdown file(s) in {raw_dir}.")
+            self._raw_status.setText(f"{len(names)} raw file(s) (.md/.txt) in {raw_dir}.")
         self._update_synth_selected_button_state()
 
     def _update_synth_selected_button_state(self) -> None:
@@ -488,7 +507,7 @@ class MainWindow(QMainWindow):
             self._btn_synth_selected.setEnabled(n > 0)
 
     def _toggle_raw_item(self, item: QListWidgetItem) -> None:
-        name = item.text()
+        name = _raw_item_basename(item)
         if name in self._raw_selected:
             self._raw_selected.discard(name)
         else:
@@ -504,7 +523,7 @@ class MainWindow(QMainWindow):
             it = self._raw_file_list.item(i)
             if it is None:
                 continue
-            n = it.text()
+            n = _raw_item_basename(it)
             if n in self._raw_selected:
                 it.setBackground(QBrush(_RAW_LIST_SEL_BG))
                 it.setForeground(QBrush(_RAW_LIST_SEL_FG))
@@ -575,10 +594,10 @@ class MainWindow(QMainWindow):
                 f"Synthesize all: raw directory not found: {raw_dir}"
             )
             return
-        names = self._repo.list_raw_markdown_files()
+        names = self._repo.list_raw_source_files()
         if not names:
             self._window_log.info(
-                "Synthesize all: no markdown files in raw directory "
+                "Synthesize all: no .md or .txt files in raw directory "
                 f"({raw_dir}, top-level only)."
             )
             return
