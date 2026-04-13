@@ -19,6 +19,28 @@ QLabel#headerWordmark {
     font-size: 14px;
     font-weight: 700;
 }
+QPushButton#synthCancel {
+    text-align: center;
+    padding: 5px 12px;
+    min-height: 0;
+    border: 1px solid #e06c75;
+    border-radius: 4px;
+    background: transparent;
+    color: #e06c75;
+    font-size: 11px;
+    font-weight: 600;
+}
+QPushButton#synthCancel:hover:enabled {
+    background-color: rgba(224, 108, 117, 0.12);
+}
+QPushButton#synthCancel:pressed:enabled {
+    background-color: rgba(224, 108, 117, 0.22);
+}
+QPushButton#synthCancel:disabled {
+    color: #5c6370;
+    border-color: #2c313c;
+    background-color: #22252a;
+}
 #sidebar {
     background-color: #21252b;
     border-right: 1px solid #3e4451;
@@ -86,11 +108,16 @@ QPushButton#primaryOutline {
     font-size: 11px;
     min-height: 0;
 }
-QPushButton#primaryOutline:hover {
+QPushButton#primaryOutline:hover:enabled {
     background-color: rgba(86, 182, 194, 0.12);
 }
-QPushButton#primaryOutline:pressed {
+QPushButton#primaryOutline:pressed:enabled {
     background-color: rgba(86, 182, 194, 0.22);
+}
+QPushButton#primaryOutline:disabled {
+    color: #5c6370;
+    background-color: #22252a;
+    border-color: #2c313c;
 }
 QPushButton#rawSynthSelected {
     text-align: center;
@@ -124,11 +151,16 @@ QPushButton#rawSynthAll {
     font-size: 11px;
     min-height: 0;
 }
-QPushButton#rawSynthAll:hover {
+QPushButton#rawSynthAll:hover:enabled {
     background-color: rgba(224, 108, 117, 0.12);
 }
-QPushButton#rawSynthAll:pressed {
+QPushButton#rawSynthAll:pressed:enabled {
     background-color: rgba(224, 108, 117, 0.22);
+}
+QPushButton#rawSynthAll:disabled {
+    color: #5c6370;
+    background-color: #22252a;
+    border-color: #2c313c;
 }
 QToolTip {
     background-color: #21252b;

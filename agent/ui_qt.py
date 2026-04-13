@@ -158,7 +158,10 @@ class SynthesisThread(QThread):
         self._raw_basenames = raw_basenames
 
     def run(self) -> None:
-        self._synth.process_raw_files(self._raw_basenames)
+        self._synth.process_raw_files(
+            self._raw_basenames,
+            cancel_check=self.isInterruptionRequested,
+        )
 
 
 class RawMarkdownListWidget(QListWidget):
@@ -224,6 +227,7 @@ class MainWindow(QMainWindow):
         self._btn_synth_selected: QPushButton | None = None
         self._btn_synth_all: QPushButton | None = None
         self._btn_synth_page: QPushButton | None = None
+        self._cancel_btns: list[QPushButton] = []
         self._synth_thread: QThread | None = None
         self._raw_selected: set[str] = set()
         self._main_splitter: QSplitter | None = None
@@ -313,14 +317,26 @@ class MainWindow(QMainWindow):
         self._stack.setObjectName("contentShell")
 
         raw_page = self._build_raw_files_panel()
+        synth_row = QWidget()
+        synth_h = QHBoxLayout(synth_row)
+        synth_h.setContentsMargins(0, 0, 0, 0)
+        synth_h.setSpacing(8)
         synth_extra = QPushButton("Synthesize All")
         synth_extra.setObjectName("primaryOutline")
         synth_extra.clicked.connect(self._on_synthesize_all)
         self._btn_synth_page = synth_extra
+        cancel_page = QPushButton("Cancel synthesis")
+        cancel_page.setObjectName("synthCancel")
+        cancel_page.setVisible(False)
+        cancel_page.clicked.connect(self._on_cancel_synthesis)
+        self._cancel_btns.append(cancel_page)
+        synth_h.addWidget(synth_extra)
+        synth_h.addWidget(cancel_page)
+        synth_h.addStretch()
         synth = _content_page(
             "Synthesize",
             "Batch synthesis sends each raw note to Gemini and writes concept files.",
-            extra=synth_extra,
+            extra=synth_row,
         )
 
         self._stack.addWidget(raw_page)
@@ -427,8 +443,14 @@ class MainWindow(QMainWindow):
         self._btn_synth_all = QPushButton("Synthesize All")
         self._btn_synth_all.setObjectName("rawSynthAll")
         self._btn_synth_all.clicked.connect(self._on_synthesize_all)
+        cancel_raw = QPushButton("Cancel synthesis")
+        cancel_raw.setObjectName("synthCancel")
+        cancel_raw.setVisible(False)
+        cancel_raw.clicked.connect(self._on_cancel_synthesis)
+        self._cancel_btns.append(cancel_raw)
         btn_row.addWidget(self._btn_synth_selected)
         btn_row.addWidget(self._btn_synth_all)
+        btn_row.addWidget(cancel_raw)
         btn_row.addStretch()
         v.addLayout(btn_row)
 
@@ -501,6 +523,9 @@ class MainWindow(QMainWindow):
         ):
             if b is not None:
                 b.setEnabled(not busy)
+        for cb in self._cancel_btns:
+            cb.setVisible(busy)
+            cb.setEnabled(busy)
 
     def _start_synthesis_thread(self, names: list[str], label: str) -> None:
         if self._synth_thread is not None and self._synth_thread.isRunning():
@@ -516,11 +541,14 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_synthesis_thread_finished(self) -> None:
-        self._set_synthesis_ui_busy(False)
         t = self._synth_thread
+        was_cancelled = bool(t is not None and t.isInterruptionRequested())
+        self._set_synthesis_ui_busy(False)
         self._synth_thread = None
         if t is not None:
             t.deleteLater()
+        if was_cancelled:
+            self._window_log.warning("Synthesis cancelled.")
         self._refresh_raw_files_list()
 
     def _on_synthesize_selected(self) -> None:
@@ -528,6 +556,17 @@ class MainWindow(QMainWindow):
             return
         names = sorted(self._raw_selected)
         self._start_synthesis_thread(names, "Synthesize selected")
+
+    def _on_cancel_synthesis(self) -> None:
+        t = self._synth_thread
+        if t is None or not t.isRunning():
+            return
+        t.requestInterruption()
+        for cb in self._cancel_btns:
+            cb.setEnabled(False)
+        self._window_log.warning(
+            "Cancel requested; will stop after the current file (API call cannot be aborted)."
+        )
 
     def _on_synthesize_all(self) -> None:
         raw_dir = self._repo.raw_dir

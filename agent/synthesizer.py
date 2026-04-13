@@ -7,6 +7,7 @@ import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Callable
 from typing import List, Set
 
 import requests
@@ -17,6 +18,10 @@ from logutil import Colors, get_logger, setup_logging
 log = get_logger(__name__)
 
 # Desktop app entry: run `python lmwiki.py` from the repository root (not this file).
+
+
+class SynthesisCancelled(Exception):
+    """Raised when cancel_check is true during Gemini retries or backoff wait."""
 
 # --- Data models (Pydantic) ---
 
@@ -235,9 +240,19 @@ class GeminiSynthesisClient:
         self._config = config
 
     @staticmethod
-    def _log_retry_countdown(seconds: int, label: str) -> None:
-        """One log line per second; sleeps ``seconds`` total."""
+    def _log_retry_countdown(
+        seconds: int,
+        label: str,
+        cancel_check: Callable[[], bool] | None,
+    ) -> None:
+        """One log line per second; sleeps ``seconds`` total unless cancel_check is true."""
         for remaining in range(seconds, 0, -1):
+            if cancel_check is not None and cancel_check():
+                log.warning(
+                    "  -> Retry countdown aborted%s (cancelled).",
+                    label,
+                )
+                raise SynthesisCancelled
             log.info(
                 f"  -> Retry countdown{label}: {remaining}s…",
                 color=Colors.CYAN,
@@ -316,6 +331,7 @@ class GeminiSynthesisClient:
         existing_tags: Set[str] | None = None,
         *,
         source_label: str | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> SynthesisOutput | None:
         """Send the prompt to Gemini API and parse the structured response (with retries)."""
         key = self._config.gemini_key
@@ -355,6 +371,9 @@ class GeminiSynthesisClient:
 
         max_attempts = 1 + self.MAX_RETRIES
         for attempt in range(1, max_attempts + 1):
+            if cancel_check is not None and cancel_check():
+                log.warning("  -> Gemini attempt cancelled before try%s.", label)
+                raise SynthesisCancelled
             log.info(
                 f"  -> Gemini API{label} attempt {attempt}/{max_attempts}…",
                 color=Colors.CYAN,
@@ -369,6 +388,9 @@ class GeminiSynthesisClient:
                     label,
                 )
                 return None
+            if cancel_check is not None and cancel_check():
+                log.warning("  -> Gemini retries cancelled%s; not waiting.", label)
+                raise SynthesisCancelled
             log.warning(
                 "  -> Gemini attempt %s/%s failed%s; %ss wait then retry (up to %s more).",
                 attempt,
@@ -377,7 +399,11 @@ class GeminiSynthesisClient:
                 self.RETRY_BACKOFF_SEC,
                 max_attempts - attempt,
             )
-            self._log_retry_countdown(self.RETRY_BACKOFF_SEC, label)
+            self._log_retry_countdown(
+                self.RETRY_BACKOFF_SEC,
+                label,
+                cancel_check,
+            )
 
 
 # --- Orchestration ---
@@ -430,10 +456,17 @@ class WikiSynthesizer:
 
         log.info("\nSynthesis run finished.")
 
-    def process_raw_files(self, raw_names: List[str]) -> None:
+    def process_raw_files(
+        self,
+        raw_names: List[str],
+        *,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> None:
         """
         Synthesize each listed raw markdown basename (top-level raw/ only).
         Skips duplicates (first occurrence wins). Logs and returns if nothing to do.
+        If cancel_check is set and returns True before a file, stops after the previous
+        file (current in-flight API call is not aborted).
         """
         if not raw_names:
             log.warning("No raw files to process.")
@@ -472,6 +505,14 @@ class WikiSynthesizer:
         available = set(self.repo.list_raw_markdown_files())
         total = len(ordered_unique)
         for idx, raw_name in enumerate(ordered_unique, start=1):
+            if cancel_check is not None and cancel_check():
+                log.warning(
+                    "Synthesis cancelled; stopped before file %s/%s (%s completed).",
+                    idx,
+                    total,
+                    idx - 1,
+                )
+                break
             if raw_name not in available:
                 log.warning(
                     "[%s/%s] Skip %r: not in raw directory or not .md",
@@ -501,12 +542,22 @@ class WikiSynthesizer:
                 continue
 
             context = f"SOURCE FILE: {raw_name}\n\n{body}"
-            synthesis_result = self.gemini.generate(
-                context,
-                self.SYSTEM_PROMPT,
-                existing_tags,
-                source_label=raw_name,
-            )
+            try:
+                synthesis_result = self.gemini.generate(
+                    context,
+                    self.SYSTEM_PROMPT,
+                    existing_tags,
+                    source_label=raw_name,
+                    cancel_check=cancel_check,
+                )
+            except SynthesisCancelled:
+                log.warning(
+                    "[%s/%s] Synthesis cancelled for %s (Gemini attempt/backoff); stopping batch.",
+                    idx,
+                    total,
+                    raw_name,
+                )
+                break
 
             if not synthesis_result or not synthesis_result.concepts:
                 log.error(
