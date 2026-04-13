@@ -4,12 +4,13 @@ import json
 import os
 import re
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Set
 
 import requests
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from logutil import Colors, get_logger, setup_logging
 
@@ -226,8 +227,87 @@ class WikiRepository:
 class GeminiSynthesisClient:
     """Call Gemini generateContent and return structured SynthesisOutput."""
 
+    #: Failures (HTTP, parse, schema, etc.) are retried this many times after the first try.
+    MAX_RETRIES = 3
+    RETRY_BACKOFF_SEC = 10
+
     def __init__(self, config: SynthesizerConfig) -> None:
         self._config = config
+
+    @staticmethod
+    def _log_retry_countdown(seconds: int, label: str) -> None:
+        """One log line per second; sleeps ``seconds`` total."""
+        for remaining in range(seconds, 0, -1):
+            log.info(
+                f"  -> Retry countdown{label}: {remaining}s…",
+                color=Colors.CYAN,
+            )
+            time.sleep(1)
+
+    def _execute_generate_attempt(
+        self,
+        url: str,
+        headers: dict[str, str],
+        payload: dict,
+        label: str,
+    ) -> SynthesisOutput | None:
+        """Single HTTP round-trip + parse. Returns None on any failure."""
+        try:
+            response = requests.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+
+            try:
+                data = response.json()
+            except json.JSONDecodeError as e:
+                log.error("API body is not JSON%s: %s", label, e)
+                return None
+
+            try:
+                llm_text = data["candidates"][0]["content"]["parts"][0]["text"]
+            except (KeyError, IndexError, TypeError) as e:
+                log.error("Unexpected Gemini response shape%s: %s", label, e)
+                if isinstance(data, dict):
+                    log.error("   Top-level keys: %s", list(data.keys()))
+                return None
+
+            log.info(
+                "  -> Received raw text from LLM. Attempting structured parsing...",
+                color=Colors.CYAN,
+            )
+            try:
+                parsed_data = LlmJsonParser.parse_json_from_llm(llm_text)
+                parsed_data = LlmJsonParser.normalize_synthesis_parsed(parsed_data)
+            except json.JSONDecodeError as e:
+                log.error(
+                    "JSON parse failed from model output%s (char %s): %s",
+                    label,
+                    getattr(e, "pos", "?"),
+                    e.msg,
+                )
+                if e.doc and isinstance(e.doc, str) and getattr(e, "pos", None) is not None:
+                    pos = min(e.pos, len(e.doc))
+                    lo = max(0, pos - 80)
+                    hi = min(len(e.doc), pos + 80)
+                    log.error("   Context around error: %r", e.doc[lo:hi])
+                else:
+                    log.error("   Raw LLM output snippet: %s", llm_text[:800])
+                return None
+
+            try:
+                return SynthesisOutput(**parsed_data)
+            except ValidationError as e:
+                log.error("Schema validation failed on model JSON%s: %s", label, e)
+                return None
+
+        except requests.exceptions.RequestException as e:
+            log.error("API CONNECTION ERROR: Could not connect to Gemini API.")
+            if hasattr(e, "response") and e.response is not None:
+                log.error(
+                    f"   Response status: {e.response.status_code}. Detail: {e.response.text}"
+                )
+            else:
+                log.error(f"   Error: {e}")
+            return None
 
     def generate(
         self,
@@ -237,14 +317,13 @@ class GeminiSynthesisClient:
         *,
         source_label: str | None = None,
     ) -> SynthesisOutput | None:
-        """Send the prompt to Gemini API and parse the structured response."""
+        """Send the prompt to Gemini API and parse the structured response (with retries)."""
         key = self._config.gemini_key
         if not key:
             log.error("GEMINI_KEY is not set.")
             return None
 
         label = f" ({source_label})" if source_label else ""
-        log.info(f"  -> Calling Gemini API{label}...", color=Colors.CYAN)
         existing_tags = existing_tags or set()
         if existing_tags:
             tag_section = (
@@ -274,42 +353,31 @@ class GeminiSynthesisClient:
             f"gemini-2.5-flash:generateContent?key={key}"
         )
 
-        try:
-            response = requests.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-
-            data = response.json()
-            llm_text = data["candidates"][0]["content"]["parts"][0]["text"]
-
+        max_attempts = 1 + self.MAX_RETRIES
+        for attempt in range(1, max_attempts + 1):
             log.info(
-                "  -> Received raw text from LLM. Attempting structured parsing...",
+                f"  -> Gemini API{label} attempt {attempt}/{max_attempts}…",
                 color=Colors.CYAN,
             )
-            try:
-                parsed_data = LlmJsonParser.parse_json_from_llm(llm_text)
-                parsed_data = LlmJsonParser.normalize_synthesis_parsed(parsed_data)
-                return SynthesisOutput(**parsed_data)
-            except json.JSONDecodeError as e:
-                log.warning("PARSING FAILED: Could not parse JSON from the model response.")
-                log.warning(f"   {e.msg} (at char {getattr(e, 'pos', '?')})")
-                if e.doc and isinstance(e.doc, str) and getattr(e, "pos", None) is not None:
-                    pos = min(e.pos, len(e.doc))
-                    lo = max(0, pos - 80)
-                    hi = min(len(e.doc), pos + 80)
-                    log.warning("   Context around error: %r", e.doc[lo:hi])
-                else:
-                    log.warning("   Raw LLM Output Snippet: %s", llm_text[:800])
-                return None
-
-        except requests.exceptions.RequestException as e:
-            log.error("API CONNECTION ERROR: Could not connect to Gemini API.")
-            if hasattr(e, "response") and e.response is not None:
+            result = self._execute_generate_attempt(url, headers, payload, label)
+            if result is not None:
+                return result
+            if attempt >= max_attempts:
                 log.error(
-                    f"   Response status: {e.response.status_code}. Detail: {e.response.text}"
+                    "  -> Gemini failed after %s attempt(s)%s; giving up.",
+                    max_attempts,
+                    label,
                 )
-            else:
-                log.error(f"   Error: {e}")
-            return None
+                return None
+            log.warning(
+                "  -> Gemini attempt %s/%s failed%s; %ss wait then retry (up to %s more).",
+                attempt,
+                max_attempts,
+                label,
+                self.RETRY_BACKOFF_SEC,
+                max_attempts - attempt,
+            )
+            self._log_retry_countdown(self.RETRY_BACKOFF_SEC, label)
 
 
 # --- Orchestration ---
@@ -353,28 +421,83 @@ class WikiSynthesizer:
             log.error("Raw directory not found: %s", raw_dir)
             raise SystemExit(1)
 
+        raw_files = self.repo.list_raw_markdown_files()
+        if not raw_files:
+            log.error("No .md files in %s", raw_dir)
+            raise SystemExit(1)
+
+        self.process_raw_files(raw_files)
+
+        log.info("\nSynthesis run finished.")
+
+    def process_raw_files(self, raw_names: List[str]) -> None:
+        """
+        Synthesize each listed raw markdown basename (top-level raw/ only).
+        Skips duplicates (first occurrence wins). Logs and returns if nothing to do.
+        """
+        if not raw_names:
+            log.warning("No raw files to process.")
+            return
+
+        if not self.config.gemini_key:
+            log.error(
+                "GEMINI_KEY environment variable is not set. Please export it before running."
+            )
+            return
+
+        raw_dir = self.config.raw_dir
+        if not raw_dir.is_dir():
+            log.error("Raw directory not found: %s", raw_dir)
+            return
+
+        ordered_unique: List[str] = []
+        seen: Set[str] = set()
+        for name in raw_names:
+            if name in seen:
+                continue
+            seen.add(name)
+            ordered_unique.append(name)
+
         existing_tags = self.repo.collect_existing_tags()
         log.info(
             f"Existing vault tags from [concepts]: {len(existing_tags)} tags found",
             color=Colors.GREEN,
         )
 
-        raw_files = self.repo.list_raw_markdown_files()
-        if not raw_files:
-            log.error("No .md files in %s", raw_dir)
-            raise SystemExit(1)
-
         log.info(
-            f"Processing {len(raw_files)} raw file(s), one concept per file",
+            f"Processing {len(ordered_unique)} raw file(s), one concept per file",
             color=Colors.CYAN,
         )
 
-        for raw_name in raw_files:
-            log.info(f"  -> Processing RAW: {raw_name}", color=Colors.GREEN)
+        available = set(self.repo.list_raw_markdown_files())
+        total = len(ordered_unique)
+        for idx, raw_name in enumerate(ordered_unique, start=1):
+            if raw_name not in available:
+                log.warning(
+                    "[%s/%s] Skip %r: not in raw directory or not .md",
+                    idx,
+                    total,
+                    raw_name,
+                )
+                continue
+
+            log.info(
+                "[%s/%s] Synthesizing: %s",
+                idx,
+                total,
+                raw_name,
+                color=Colors.CYAN,
+            )
             try:
                 body = self.repo.load_raw_file_contents(raw_name)
             except OSError as e:
-                log.error("  -> Could not read file: %s", e)
+                log.error(
+                    "[%s/%s] Read failed for %s: %s",
+                    idx,
+                    total,
+                    raw_name,
+                    e,
+                )
                 continue
 
             context = f"SOURCE FILE: {raw_name}\n\n{body}"
@@ -386,28 +509,67 @@ class WikiSynthesizer:
             )
 
             if not synthesis_result or not synthesis_result.concepts:
-                log.warning("\tNo concept produced; skipping.")
+                log.error(
+                    "[%s/%s] Synthesis produced no concept for %s (API or parse error; see messages above).",
+                    idx,
+                    total,
+                    raw_name,
+                )
                 continue
 
             if len(synthesis_result.concepts) > 1:
                 log.warning(
-                    f"\tModel returned {len(synthesis_result.concepts)} concepts; "
-                    "using only the first for one-to-one mode.",
+                    "[%s/%s] %s: model returned %s concepts; using only the first.",
+                    idx,
+                    total,
+                    raw_name,
+                    len(synthesis_result.concepts),
                 )
 
             concept = synthesis_result.concepts[0]
             out_stem = WikiRepository.safe_filename_stem_from_raw(raw_name)
-            self.repo.write_concept_file(concept, output_stem=out_stem)
+            out_path = self.config.concepts_dir / f"{out_stem}.md"
+            try:
+                self.repo.write_concept_file(concept, output_stem=out_stem)
+            except OSError as e:
+                log.error(
+                    "[%s/%s] Write concept failed for %s -> %s: %s",
+                    idx,
+                    total,
+                    raw_name,
+                    out_path,
+                    e,
+                )
+                continue
 
+            for t in TagUtils.normalize_list(concept.tags) or ["wiki"]:
+                existing_tags.add(t)
+
+            processed_path = raw_dir / "processed" / raw_name
+            move_ok = False
             try:
                 target_dir = raw_dir / "processed"
                 target_dir.mkdir(parents=True, exist_ok=True)
                 src_path = raw_dir / raw_name
                 shutil.move(str(src_path), str(target_dir / raw_name))
+                move_ok = True
             except OSError as e:
-                log.warning("   OS Error during file move for %s: %s", raw_name, e)
+                log.error(
+                    "[%s/%s] Move raw file failed for %s (concept written to %s): %s",
+                    idx,
+                    total,
+                    raw_name,
+                    out_path,
+                    e,
+                )
 
-            for t in TagUtils.normalize_list(concept.tags) or ["wiki"]:
-                existing_tags.add(t)
-
-        log.info("\nSynthesis run finished.")
+            if move_ok:
+                log.info(
+                    "[%s/%s] Finished %s: wrote %s; moved raw to %s",
+                    idx,
+                    total,
+                    raw_name,
+                    out_path,
+                    processed_path,
+                    color=Colors.GREEN,
+                )

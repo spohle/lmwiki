@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import html
 import logging
 import sys
 from collections.abc import Callable
 
-from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, QSize, Qt, QThread, QTimer
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -29,18 +30,18 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
-    QPlainTextEdit,
     QPushButton,
     QSplitter,
     QStackedWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from logutil import LOGGER_NAME, setup_logging
-from synthesizer import SynthesizerConfig, WikiRepository
+from synthesizer import SynthesizerConfig, WikiRepository, WikiSynthesizer
 from ui_stylesheet import APPLICATION_STYLESHEET
-from window_log import QtPanelLogHandler, WindowLog
+from window_log import QtLogEmitter, QtPanelLogHandler, WindowLog
 
 _RAW_LIST_BG = QColor("#282c34")
 _RAW_LIST_BG_ALT = QColor("#2c313a")
@@ -53,6 +54,20 @@ _RAW_LIST_BULLET_D = 7
 _RAW_LIST_BULLET_NORMAL = QColor("#7f848e")
 _RAW_LIST_BULLET_SELECTED = QColor("#1e222a")
 _raw_list_bullet_icon_cache: tuple[QIcon, QIcon] | None = None
+
+
+def _log_color_for_level(levelno: int) -> str:
+    """Hex colors aligned with One Dark; stderr stays unstyled."""
+    if levelno >= logging.CRITICAL:
+        return "#ff7b72"  # bright red
+    if levelno >= logging.ERROR:
+        return "#e06c75"  # salmon (theme accent)
+    if levelno >= logging.WARNING:
+        return "#e5c07b"  # yellow
+    if levelno >= logging.INFO:
+        return "#abb2bf"  # default foreground
+    # DEBUG and below
+    return "#7f848e"  # muted
 
 
 def _raw_list_bullet_icons() -> tuple[QIcon, QIcon]:
@@ -129,6 +144,23 @@ def _content_page(title: str, body: str, *, extra: QWidget | None = None) -> QWi
     return w
 
 
+class SynthesisThread(QThread):
+    """Runs WikiSynthesizer.process_raw_files off the GUI thread."""
+
+    def __init__(
+        self,
+        synth: WikiSynthesizer,
+        raw_basenames: list[str],
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._synth = synth
+        self._raw_basenames = raw_basenames
+
+    def run(self) -> None:
+        self._synth.process_raw_files(self._raw_basenames)
+
+
 class RawMarkdownListWidget(QListWidget):
     """Toggle row highlight on click; Qt does not emit itemClicked when selection is NoSelection."""
 
@@ -184,13 +216,18 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("LM Wiki")
         self.resize(1280, 680)
-        self._repo = WikiRepository(SynthesizerConfig())
+        self._cfg = SynthesizerConfig()
+        self._repo = WikiRepository(self._cfg)
+        self._synth = WikiSynthesizer(self._cfg)
         self._raw_file_list: QListWidget | None = None
         self._raw_status: QLabel | None = None
         self._btn_synth_selected: QPushButton | None = None
+        self._btn_synth_all: QPushButton | None = None
+        self._btn_synth_page: QPushButton | None = None
+        self._synth_thread: QThread | None = None
         self._raw_selected: set[str] = set()
         self._main_splitter: QSplitter | None = None
-        self._log: QPlainTextEdit | None = None
+        self._log: QTextEdit | None = None
         self._splitter_sizes_initialized = False
 
         root = QWidget()
@@ -208,7 +245,8 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self._main_splitter, stretch=1)
 
         self.setCentralWidget(root)
-        self._window_log = WindowLog(self.append_log)
+        self._window_log = WindowLog(self.append_log_line)
+        self._log_emitter = QtLogEmitter(self._window_log, self)
 
     def _build_header(self) -> QWidget:
         header = QWidget()
@@ -238,23 +276,29 @@ class MainWindow(QMainWindow):
         self._main_splitter.setSizes([int(h * 0.8), int(h * 0.2)])
         self._splitter_sizes_initialized = True
 
-    def _build_log_panel(self) -> QPlainTextEdit:
-        log = QPlainTextEdit()
+    def _build_log_panel(self) -> QTextEdit:
+        log = QTextEdit()
         log.setObjectName("appLog")
         log.setReadOnly(True)
+        log.setAcceptRichText(True)
         log.setPlaceholderText("Log output…")
         log.setMinimumHeight(80)
-        log.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        log.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         f = QFont()
         f.setStyleHint(QFont.StyleHint.Monospace)
         f.setPointSize(10)
         log.setFont(f)
         return log
 
-    def append_log(self, text: str) -> None:
+    def append_log_line(self, levelno: int, text: str) -> None:
         if self._log is None:
             return
-        self._log.appendPlainText(text)
+        color = _log_color_for_level(levelno)
+        safe = html.escape(text, quote=True)
+        self._log.moveCursor(QTextCursor.MoveOperation.End)
+        self._log.insertHtml(
+            f'<span style="color:{color}; font-family:monospace; font-size:10pt;">{safe}</span><br>'
+        )
         self._log.moveCursor(QTextCursor.MoveOperation.End)
         self._log.ensureCursorVisible()
 
@@ -269,9 +313,10 @@ class MainWindow(QMainWindow):
         self._stack.setObjectName("contentShell")
 
         raw_page = self._build_raw_files_panel()
-        synth_extra = QPushButton("Run synthesis (stub)")
+        synth_extra = QPushButton("Synthesize All")
         synth_extra.setObjectName("primaryOutline")
         synth_extra.clicked.connect(self._on_synthesize_all)
+        self._btn_synth_page = synth_extra
         synth = _content_page(
             "Synthesize",
             "Batch synthesis sends each raw note to Gemini and writes concept files.",
@@ -448,13 +493,41 @@ class MainWindow(QMainWindow):
                 it.setForeground(QBrush(_RAW_LIST_FG))
                 it.setIcon(normal_icon)
 
+    def _set_synthesis_ui_busy(self, busy: bool) -> None:
+        for b in (
+            self._btn_synth_selected,
+            self._btn_synth_all,
+            self._btn_synth_page,
+        ):
+            if b is not None:
+                b.setEnabled(not busy)
+
+    def _start_synthesis_thread(self, names: list[str], label: str) -> None:
+        if self._synth_thread is not None and self._synth_thread.isRunning():
+            self._window_log.warning("Synthesis already running; wait for it to finish.")
+            return
+        if not names:
+            return
+        self._window_log.info(f"{label} ({len(names)} file(s)): {', '.join(names)}")
+        self._set_synthesis_ui_busy(True)
+        worker = SynthesisThread(self._synth, names, self)
+        self._synth_thread = worker
+        worker.finished.connect(self._on_synthesis_thread_finished)
+        worker.start()
+
+    def _on_synthesis_thread_finished(self) -> None:
+        self._set_synthesis_ui_busy(False)
+        t = self._synth_thread
+        self._synth_thread = None
+        if t is not None:
+            t.deleteLater()
+        self._refresh_raw_files_list()
+
     def _on_synthesize_selected(self) -> None:
         if not self._raw_selected:
             return
         names = sorted(self._raw_selected)
-        self._window_log.info(
-            f"Synthesize selected ({len(names)} file(s)): {', '.join(names)}"
-        )
+        self._start_synthesis_thread(names, "Synthesize selected")
 
     def _on_synthesize_all(self) -> None:
         raw_dir = self._repo.raw_dir
@@ -470,9 +543,7 @@ class MainWindow(QMainWindow):
                 f"({raw_dir}, top-level only)."
             )
             return
-        self._window_log.info(
-            f"Synthesize all ({len(names)} file(s)): {', '.join(names)}"
-        )
+        self._start_synthesis_thread(names, "Synthesize all")
 
     @staticmethod
     def _on_exit() -> None:
@@ -483,7 +554,7 @@ def _attach_qt_panel_log_handler(window: MainWindow) -> None:
     lg = logging.getLogger(LOGGER_NAME)
     if any(isinstance(h, QtPanelLogHandler) for h in lg.handlers):
         return
-    h = QtPanelLogHandler(window._window_log)
+    h = QtPanelLogHandler(window._log_emitter)
     h.setLevel(lg.level)
     lg.addHandler(h)
 

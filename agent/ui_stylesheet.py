@@ -140,7 +140,7 @@ QToolTip {
     border-radius: 3px;
     background: transparent;
 }
-QPlainTextEdit#appLog {
+QTextEdit#appLog {
     background-color: #282c34;
     color: #abb2bf;
     border: 1px solid #3e4451;
